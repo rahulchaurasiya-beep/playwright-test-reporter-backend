@@ -2,6 +2,7 @@ import { statSync } from "node:fs";
 import { latestTestsForSpecSql } from "../latest-tests-sql.js";
 import type { DbClient } from "../postgres-db-client.js";
 import type { IRunStore } from "./run-store.interface.js";
+import { computeRunDurationMs } from "../../utils/run-duration.js";
 import { specKey, worstStatus } from "./utils.js";
 import type {
   ArtifactRecord,
@@ -153,7 +154,7 @@ export class SqlRunStore implements IRunStore {
       };
     }
 
-    return {
+    const run: RunRecord = {
       ciBuildId: row.ci_build_id,
       projectId: row.project_id,
       status: row.status as RunRecord["status"],
@@ -167,6 +168,9 @@ export class SqlRunStore implements IRunStore {
       durationMs: row.duration_ms,
       shards,
     };
+
+    run.durationMs = computeRunDurationMs(run);
+    return run;
   }
 
   async startRun(payload: RunStartPayload): Promise<RunRecord> {

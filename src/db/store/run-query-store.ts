@@ -1,4 +1,5 @@
 import { latestTestCountSql } from "../latest-tests-sql.js";
+import { runDurationMsSql } from "../run-duration-sql.js";
 import type { DbClient } from "../postgres-db-client.js";
 import type { CiInfo, GitInfo } from "../../types.js";
 import type { RunListSummary, RunSearchFilters, RunSearchResult } from "../../types/run-search.js";
@@ -135,7 +136,7 @@ export class RunQueryStore {
       r.ci,
       r.created_at,
       r.ended_at,
-      r.duration_ms,
+      ${runDurationMsSql("r")} AS duration_ms,
       (SELECT COUNT(*)::int FROM shards s WHERE s.ci_build_id = r.ci_build_id) AS shard_count,
       (SELECT COUNT(*)::int FROM specs sp WHERE sp.ci_build_id = r.ci_build_id) AS spec_count,
       ${latestTestCountSql("passed")} AS passed,
