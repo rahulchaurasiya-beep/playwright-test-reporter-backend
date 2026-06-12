@@ -3,7 +3,20 @@ import { SCHEMA_SQL } from "./schema.js";
 
 const { Pool } = pg;
 
-/** RDS requires SSL; local Docker postgres does not. */
+/** Remove ssl* query params so Pool ssl config is not overridden by pg-connection-string. */
+function stripSslQueryParams(connectionString: string): string {
+  const q = connectionString.indexOf("?");
+  if (q === -1) return connectionString;
+  const base = connectionString.slice(0, q);
+  const params = new URLSearchParams(connectionString.slice(q + 1));
+  for (const key of ["sslmode", "ssl", "uselibpqcompat"]) {
+    params.delete(key);
+  }
+  const rest = params.toString();
+  return rest ? `${base}?${rest}` : base;
+}
+
+/** RDS requires encrypted connections; skip CA verify (Amazon RDS CA). */
 function resolveSsl(
   connectionString: string,
 ): { rejectUnauthorized: boolean } | undefined {
@@ -32,8 +45,9 @@ export class PostgresDbClient implements DbClient {
 
   constructor(connectionString: string) {
     const ssl = resolveSsl(connectionString);
+    const normalizedUrl = ssl ? stripSslQueryParams(connectionString) : connectionString;
     this.pool = new Pool({
-      connectionString,
+      connectionString: normalizedUrl,
       max: 20,
       ...(ssl ? { ssl } : {}),
     });
