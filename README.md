@@ -6,37 +6,87 @@ Designed to replace Currents.dev for Rocketium E2E runs (staging sharding, CI, l
 
 ---
 
-## High-level architecture
+## AWS deployment architecture
+
+Production runs on AWS. Full step-by-step setup: [`docs/aws-deployment-guide.html`](docs/aws-deployment-guide.html).
 
 ```mermaid
 flowchart TB
-  subgraph clients["Clients"]
-    PW[Playwright tests]
+  subgraph ci["CI / Playwright"]
     R[playwright-rocketium-reporter]
-    UI[Future dashboard UI]
   end
 
-  subgraph backend["playwright-reporter-backend :3000"]
-    API[Express API /api/v1]
-    AUTH[Bearer auth optional]
-    STORE[(Run store)]
+  subgraph aws["AWS"]
+    ALB[ALB / API URL]
+    BE[Backend Express :3000 on EC2]
+    RDS[(RDS PostgreSQL private)]
+    S3[(S3 artifacts bucket)]
+    CF[CloudFront]
+    UI[S3 static site]
   end
 
-  subgraph metadata["Metadata storage"]
-    PG[(PostgreSQL)]
-  end
+  R -->|POST /api/v1/runs/*| ALB
+  ALB --> BE
+  BE --> RDS
+  BE -->|upload / serve artifacts| S3
+  Browser --> CF
+  CF --> UI
+  CF -->|/api/*| ALB
+```
 
-  subgraph files["Binary storage"]
-    UP[uploads/ ciBuildId / testId / files]
-  end
+### What each AWS service does
 
-  PW --> R
-  R -->|JSON + multipart| API
-  UI -->|GET| API
-  API --> AUTH --> STORE
-  STORE --> PG
-  API -->|multer| UP
-  STORE -.->|artifact paths| UP
+| Layer | Stores | Backend env var |
+|-------|--------|-----------------|
+| **RDS PostgreSQL** | Runs, shards, specs, tests, artifact pointers, users, projects | `DATABASE_URL` |
+| **S3** | Screenshot / video / trace files | `ARTIFACT_STORAGE=s3`, `AWS_S3_BUCKET`, `AWS_REGION` |
+| **EC2** | Runs Express API (no persistent files when using S3) | `PORT`, `JWT_SECRET` |
+| **CloudFront + S3** | Built React UI (`dist/`) | None — static files only |
+
+RDS and S3 work **together**: Postgres holds metadata; S3 holds binary artifacts.
+
+### Production data flow (one CI shard)
+
+```mermaid
+sequenceDiagram
+  participant GH as GitHub Actions
+  participant PW as Playwright + Reporter
+  participant API as Backend EC2
+  participant DB as RDS PostgreSQL
+  participant S3 as S3 Bucket
+  participant UI as Dashboard UI
+
+  GH->>PW: Run tests with REPORTER_* env
+  PW->>API: POST /api/v1/runs/start
+  API->>DB: Insert run + shard
+  loop Each test
+    PW->>API: POST /api/v1/runs/tests
+    API->>DB: Insert test result
+    opt On failure
+      PW->>API: POST /api/v1/runs/artifacts
+      API->>S3: Upload file
+      API->>DB: Store S3 pointer
+    end
+  end
+  PW->>API: POST /api/v1/runs/shard/finish
+  API->>DB: Update run status
+  UI->>API: GET /api/ui/projects/.../runs
+  API->>DB: Query runs
+  UI->>API: GET artifact file
+  API->>S3: Stream artifact
+```
+
+### Deployment order
+
+```text
+1. RDS PostgreSQL     → save DATABASE_URL
+2. S3 artifacts       → save bucket name + IAM role on EC2
+3. EC2 backend        → .env + pnpm start (+ Nginx / ALB)
+4. S3 + CloudFront UI → build dist/, upload, route /api/*
+5. Dashboard          → create project, copy API key + project ID
+6. GitHub secrets     → REPORTER_API_URL, REPORTER_API_KEY
+7. CI workflow        → REPORTER_PROJECT_ID, shard vars
+8. Verify             → /health + run workflow + check UI
 ```
 
 ### Data hierarchy (UI model)
@@ -67,28 +117,16 @@ flowchart LR
 
 Two layers: **metadata** (run tree) and **binaries** (files).
 
-```mermaid
-flowchart TB
-  subgraph meta["Metadata — PostgreSQL"]
-    P[PostgreSQL<br/>DATABASE_URL]
-  end
+| Environment | Metadata | Artifacts |
+|-------------|----------|-----------|
+| **Production (AWS)** | RDS PostgreSQL | S3 bucket (`ARTIFACT_STORAGE=s3`) |
+| **Local dev** | Docker Postgres (`pnpm db:up`) | `./uploads/` (`ARTIFACT_STORAGE=local` or unset) |
 
-  subgraph binary["Binaries — always on disk"]
-    U[UPLOADS_DIR/<br/>ciBuildId/testId/timestamp-name]
-  end
+Run metadata is stored in **PostgreSQL**. Set `DATABASE_URL` or run `pnpm db:up` for local dev. JSON file storage is not supported.
 
-  API[Reporter API] --> meta
-  API --> binary
-  meta -->|file_path column| U
-```
+**Binaries are never stored inside the DB.** The `artifacts` table only keeps `file_path`, `content_type`, `size_bytes`, and `name` (S3 key or local path). Max upload size: **200 MB** per file.
 
-### Metadata storage
-
-Run metadata is stored in **PostgreSQL**. Set `DATABASE_URL` or run `pnpm db:up`. JSON file storage is not supported.
-
-**Binaries are never stored inside the DB.** The `artifacts` table (or JSON on the test) only keeps `file_path`, `content_type`, `size_bytes`, and `name`. Max upload size: **200 MB** per file.
-
-### On-disk layout
+### Local artifact layout (`ARTIFACT_STORAGE=local`)
 
 ```
 playwright-reporter-backend/
@@ -100,6 +138,19 @@ playwright-reporter-backend/
             ├── 1738...-video.webm
             └── 1738...-error-context.md
 ```
+
+### Production artifact layout (S3)
+
+```
+s3://<AWS_S3_BUCKET>/<AWS_S3_PREFIX>/
+└── <ciBuildId>/
+    └── <testId>/
+        ├── screenshot.png
+        ├── video.webm
+        └── error-context.md
+```
+
+See also: [`docs/aws-s3-artifacts.html`](docs/aws-s3-artifacts.html).
 
 ---
 
@@ -291,10 +342,20 @@ pnpm summary local-123    # print Run → Shards → Specs → Tests
 |----------|---------|-------------|
 | `PORT` | `3000` | HTTP port |
 | `DATABASE_URL` | `postgresql://...@localhost:5432/rocketium_e2e_runs` | Postgres connection string |
+| `DATABASE_SSL` | auto for RDS | Set `true` for RDS; `false` for local Docker |
+| `ARTIFACT_STORAGE` | `local` | `s3` in production, `local` for dev |
+| `AWS_REGION` | — | Required when `ARTIFACT_STORAGE=s3` |
+| `AWS_S3_BUCKET` | — | S3 bucket for artifacts |
+| `AWS_S3_PREFIX` | `artifacts` | Key prefix inside the bucket |
+| `S3_ARTIFACT_URL_MODE` | `proxy` | `proxy` or `redirect` for artifact URLs |
+| `JWT_SECRET` | — | Required for UI auth (`/api/ui/*`) |
+| `JWT_EXPIRES_IN` | `7d` | JWT lifetime |
 | `DATA_DIR` | `./data` | Legacy data directory |
-| `UPLOADS_DIR` | `./uploads` | Artifact files root |
+| `UPLOADS_DIR` | `./uploads` | Local artifact root (when not using S3) |
 
-Reporter clients use per-project `REPORTER_PROJECT_ID` + `REPORTER_API_KEY` (not a backend env var).
+Reporter clients use per-project `REPORTER_PROJECT_ID` + `REPORTER_API_KEY` (created in the UI — not a backend env var).
+
+Full production reference: [`docs/aws-deployment-guide.html`](docs/aws-deployment-guide.html).
 
 ---
 
@@ -316,6 +377,8 @@ src/
         ├── run-filter-store.ts
         └── analytics-store.ts
 docs/
+├── aws-deployment-guide.html
+├── aws-s3-artifacts.html
 ├── DATABASE.md
 └── FAILURE_AND_ARTIFACTS.md
 ```
@@ -327,13 +390,14 @@ docs/
 | Repo | Role |
 |------|------|
 | [`rocketium-playwright-reporter`](../rocketium-playwright-reporter) | Playwright reporter package (sends events to this API) |
+| [`playwright-reporter-ui`](../playwright-reporter-ui) | React dashboard (runs, projects, artifact viewer) |
 | [`automation-tests-2.0`](../automation-tests-2.0) | E2E suite + `reporter.config.ts` + local shard runner |
 
 ---
 
 ## Roadmap
 
-- [ ] Web UI (run list, drill-down, artifact viewer)
-- [ ] S3-backed `uploads/` for CI
+- [x] Web UI (run list, drill-down, artifact viewer)
+- [x] S3-backed artifacts for CI / production
 - [ ] Formal migrations (e.g. Drizzle / node-pg-migrate)
 - [ ] Retention / cleanup jobs for old runs and files

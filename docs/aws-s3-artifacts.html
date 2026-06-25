@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS S3 Artifact Storage — Implementation Guide</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    @page {
+      size: A4;
+      margin: 16mm 14mm;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #1a1a1a;
+      line-height: 1.45;
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 22px;
+      font-size: 13px;
+    }
+
+    h1 {
+      font-size: 21px;
+      margin-bottom: 6px;
+      border-bottom: 2px solid #2563eb;
+      padding-bottom: 8px;
+    }
+
+    h2 {
+      font-size: 16px;
+      margin-top: 24px;
+      margin-bottom: 10px;
+      color: #1e40af;
+    }
+
+    h3 {
+      font-size: 14px;
+      margin-top: 16px;
+      margin-bottom: 8px;
+      color: #374151;
+    }
+
+    p { margin: 0 0 10px; }
+
+    .intro { color: #374151; margin-bottom: 16px; }
+
+    .diagram-block {
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 14px;
+      margin: 12px 0 18px;
+      page-break-inside: avoid;
+    }
+
+    .mermaid { display: flex; justify-content: center; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10px 0 16px;
+      font-size: 12px;
+    }
+
+    th, td {
+      border: 1px solid #d1d5db;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th { background: #eff6ff; font-weight: 600; }
+    tr:nth-child(even) td { background: #f9fafb; }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 11px;
+      background: #f3f4f6;
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+
+    pre {
+      background: #1e293b;
+      color: #e2e8f0;
+      padding: 14px 16px;
+      border-radius: 8px;
+      font-size: 11px;
+      line-height: 1.5;
+      overflow-x: auto;
+      margin: 10px 0 16px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    ul, ol { margin: 8px 0 12px; padding-left: 20px; }
+    li { margin-bottom: 4px; }
+
+    .page-break { page-break-before: always; }
+
+    .footer {
+      margin-top: 24px;
+      padding-top: 10px;
+      border-top: 1px solid #e5e7eb;
+      font-size: 11px;
+      color: #6b7280;
+    }
+
+    .note {
+      background: #fffbeb;
+      border: 1px solid #fcd34d;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin: 12px 0;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>AWS S3 Artifact Storage — Implementation Guide</h1>
+  <p class="intro">
+    Practical plan for adding <strong>S3 artifact storage</strong> to
+    <code>playwright-reporter-backend</code>. Postgres stays as-is; only
+    <strong>screenshots, videos, and traces</strong> move from <code>uploads/</code> to S3.
+  </p>
+
+  <h2>Current flow (what you have)</h2>
+  <div class="diagram-block">
+    <pre class="mermaid">
+flowchart LR
+  Reporter -->|POST /runs/artifacts multipart| API
+  API -->|multer disk| Local[uploads/ciBuildId/testId/file]
+  API -->|file_path in DB| PG[(Postgres)]
+  UI -->|GET /artifacts/:id/file| API
+  API -->|sendFile| Local
+    </pre>
+  </div>
+  <p><strong>Reporter package does not need changes</strong> — same API, same multipart upload.</p>
+
+  <h2>Target flow</h2>
+  <div class="diagram-block">
+    <pre class="mermaid">
+flowchart LR
+  Reporter -->|POST /runs/artifacts| API
+  API -->|PutObject| S3[(S3 bucket)]
+  API -->|s3 key in DB| PG[(Postgres)]
+  UI -->|GET /artifacts/:id/file| API
+  API -->|stream or presigned URL| S3
+    </pre>
+  </div>
+
+  <h2>Step 1 — AWS setup (do this first)</h2>
+  <ol>
+    <li>
+      <strong>Create S3 bucket</strong><br />
+      Example: <code>rocketium-playwright-artifacts</code><br />
+      Region: same as your backend (e.g. <code>ap-south-1</code>).
+    </li>
+    <li><strong>Keep bucket private</strong> — block all public access (default).</li>
+    <li><strong>Create IAM policy</strong> (minimal):</li>
+  </ol>
+  <pre>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::rocketium-playwright-artifacts/artifacts/*"
+    }
+  ]
+}</pre>
+  <ol start="4">
+    <li>
+      <strong>Attach to:</strong>
+      <ul>
+        <li><strong>Local dev:</strong> IAM user + access keys</li>
+        <li><strong>Prod/CI server:</strong> IAM role on EC2/ECS (no keys in env)</li>
+      </ul>
+    </li>
+    <li><strong>Optional lifecycle rule</strong> — delete objects under <code>artifacts/</code> after 30–90 days.</li>
+  </ol>
+
+  <div class="page-break"></div>
+
+  <h2>Step 2 — Backend env vars</h2>
+  <p>Add to <code>.env</code>:</p>
+  <pre>ARTIFACT_STORAGE=s3          # local | s3
+AWS_REGION=ap-south-1
+AWS_S3_BUCKET=rocketium-playwright-artifacts
+AWS_S3_PREFIX=artifacts      # optional folder prefix
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+# S3_ARTIFACT_URL_MODE=proxy  # proxy (default) | redirect (presigned URL)
+# S3_PRESIGN_EXPIRES_SEC=3600</pre>
+  <p>Keep <code>ARTIFACT_STORAGE=local</code> until S3 code is done.</p>
+
+  <h2>Step 3 — Code changes (backend)</h2>
+
+  <h3>3a. Add storage abstraction</h3>
+  <p>New file: <code>src/storage/artifact-storage.ts</code></p>
+  <pre>interface ArtifactStorage {
+  upload(params: {
+    key: string;
+    body: Buffer | Readable;
+    contentType: string;
+  }): Promise&lt;{ key: string; sizeBytes: number }&gt;;
+
+  getReadable(key: string): Promise&lt;{ body: Readable; contentType?: string }&gt;;
+
+  getPresignedUrl?(key: string, expiresSec: number): Promise&lt;string&gt;;
+}</pre>
+  <p>Implement:</p>
+  <ul>
+    <li><code>LocalArtifactStorage</code> — current <code>uploads/</code> behavior</li>
+    <li><code>S3ArtifactStorage</code> — <code>@aws-sdk/client-s3</code> + <code>@aws-sdk/lib-storage</code> (for large videos up to 200 MB)</li>
+  </ul>
+
+  <h3>3b. S3 object key layout</h3>
+  <p>Mirror your local paths:</p>
+  <pre>artifacts/{ciBuildId}/{testId}/{timestamp}-{name}</pre>
+  <p>Example:</p>
+  <pre>artifacts/26999331755/abc123-testId/1738123456789-screenshot.png</pre>
+  <p>
+    Store this key in <code>artifacts.file_path</code> (or prefix with <code>s3:</code> so old local rows still work).
+  </p>
+
+  <h3>3c. Change upload route (<code>routes/runs.ts</code>)</h3>
+  <p>Today: <code>multer.diskStorage</code> → local file → <code>store.addArtifact(..., file.path)</code>.</p>
+  <p>Change to:</p>
+  <ol>
+    <li><code>multer.memoryStorage()</code> <strong>or</strong> temp disk + stream</li>
+    <li>Build S3 key from <code>ciBuildId</code>, <code>testId</code>, filename</li>
+    <li><code>artifactStorage.upload(...)</code></li>
+    <li><code>store.addArtifact(..., s3Key, sizeBytes)</code></li>
+    <li>Delete temp file if you used disk</li>
+  </ol>
+  <p>
+    Use <strong><code>@aws-sdk/lib-storage</code> <code>Upload</code></strong> for streaming — avoids loading 200 MB videos fully into RAM.
+  </p>
+
+  <h3>3d. Change download route</h3>
+  <p><code>GET /api/v1/artifacts/:id/file</code>:</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th>Behavior</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>proxy</strong> (simplest)</td>
+        <td><code>GetObject</code> from S3 → pipe to <code>res</code> (same URL as today)</td>
+      </tr>
+      <tr>
+        <td><strong>redirect</strong></td>
+        <td>302 to presigned URL (less load on API, good for UI)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>Detect storage from <code>file_path</code>:</p>
+  <ul>
+    <li>starts with <code>s3:</code> or matches S3 key pattern → S3</li>
+    <li>else → local file (backward compatible)</li>
+  </ul>
+
+  <h3>3e. Schema (optional, later)</h3>
+  <p>For now, <strong>reuse <code>file_path</code></strong> as storage key. Later you can add:</p>
+  <pre>ALTER TABLE artifacts ADD COLUMN storage TEXT NOT NULL DEFAULT 'local';</pre>
+  <p>Not required for v1.</p>
+
+  <h3>3f. Wire in <code>index.ts</code></h3>
+  <pre>const artifactStorage = createArtifactStorage({ uploadsDir, ...s3Config });
+createRunsRouter(store, artifactStorage);</pre>
+  <p>Remove or keep <code>express.static('/uploads')</code> only for legacy local files.</p>
+
+  <div class="page-break"></div>
+
+  <h2>Step 4 — Packages to install</h2>
+  <pre>cd playwright-reporter-backend
+pnpm add @aws-sdk/client-s3 @aws-sdk/lib-storage @aws-sdk/s3-request-presigner</pre>
+
+  <h2>Step 5 — Test plan</h2>
+  <ol>
+    <li><code>ARTIFACT_STORAGE=local</code> — confirm nothing breaks</li>
+    <li><code>ARTIFACT_STORAGE=s3</code> — run one failing test locally (screenshot + video upload)</li>
+    <li>Check S3 console for object under <code>artifacts/{ciBuildId}/...</code></li>
+    <li>Open <code>GET /api/v1/artifacts/{id}/file</code> in browser</li>
+    <li>Run <code>pnpm summary</code> — artifact names still show; file served from S3</li>
+  </ol>
+
+  <h2>Step 6 — CI / GitHub Actions</h2>
+  <p>No test repo changes. On the <strong>hosted backend</strong>:</p>
+  <ul>
+    <li>Set <code>ARTIFACT_STORAGE=s3</code> + bucket env vars</li>
+    <li>Use IAM role (preferred) or GitHub secrets if backend runs in Actions</li>
+  </ul>
+  <p>Reporter still sends files to your API; the API uploads to S3.</p>
+
+  <h2>Recommended implementation order</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Order</th>
+        <th>Task</th>
+        <th>Effort</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>AWS bucket + IAM</td><td>~30 min</td></tr>
+      <tr><td>2</td><td><code>ArtifactStorage</code> interface + S3 client</td><td>~2 h</td></tr>
+      <tr><td>3</td><td>Update POST <code>/runs/artifacts</code></td><td>~1 h</td></tr>
+      <tr><td>4</td><td>Update GET <code>/artifacts/:id/file</code></td><td>~1 h</td></tr>
+      <tr><td>5</td><td>Env config + docs</td><td>~30 min</td></tr>
+      <tr><td>6</td><td>Optional: migrate old <code>uploads/</code> to S3</td><td>later</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Decisions to make before coding</h2>
+  <ol>
+    <li>
+      <strong>Presigned URL vs proxy through API?</strong>
+      <ul>
+        <li>Proxy: simpler, same URLs, API pays bandwidth</li>
+        <li>Presigned: better for future UI at scale</li>
+      </ul>
+    </li>
+    <li>
+      <strong>One bucket for all envs or separate?</strong>
+      <ul>
+        <li>e.g. <code>rocketium-playwright-artifacts-staging</code> / <code>-prod</code></li>
+      </ul>
+    </li>
+    <li><strong>Retention</strong> — auto-delete artifacts after N days via S3 lifecycle?</li>
+  </ol>
+
+  <h2>What you don’t need to change</h2>
+  <ul>
+    <li>Postgres schema (minimal)</li>
+    <li><code>playwright-rocketium-reporter</code></li>
+    <li><code>automation-tests-2.0</code> reporter config</li>
+    <li>Test upload flow (still multipart to same endpoint)</li>
+  </ul>
+
+  <div class="note">
+    <strong>Next step:</strong> Implement Step 3 in <code>playwright-reporter-backend</code> —
+    <code>ArtifactStorage</code> abstraction, S3 upload/download, and
+    <code>ARTIFACT_STORAGE=local|s3</code> toggle with backward compatibility for existing local artifacts.
+  </div>
+
+  <p class="footer">
+    playwright-reporter-backend · AWS S3 artifact storage guide · Generated for Rocketium E2E reporter
+  </p>
+
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+  </script>
+</body>
+</html>
