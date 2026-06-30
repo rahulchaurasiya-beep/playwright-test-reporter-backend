@@ -70,7 +70,7 @@ app.use(
 app.use(
   "/api/v1",
   createReporterAuthMiddleware(projectStore),
-  createRunsRouter(store, artifactStorage, uploadsDir, runFilterStore),
+  createRunsRouter(store, artifactStorage, uploadsDir, projectStore, runFilterStore),
 );
 
 const server = app.listen(port, () => {
