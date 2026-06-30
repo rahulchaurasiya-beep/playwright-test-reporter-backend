@@ -34,7 +34,7 @@ const PASSWORD_MIN_LENGTH = 8;
 const BCRYPT_ROUNDS = 10;
 
 export class UserStore {
-  constructor(private readonly db: DbClient) {}
+  constructor(private readonly db: DbClient) { }
 
   async createUser(payload: SignupPayload): Promise<UserRecord> {
     const username = payload.username?.trim()

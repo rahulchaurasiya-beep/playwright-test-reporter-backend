@@ -5,11 +5,13 @@ import multer from "multer";
 import { join, resolve } from "node:path";
 import type { ArtifactStorage } from "../storage/artifact-storage.js";
 import type {
+  RunRecord,
   RunStartPayload,
   ShardFinishPayload,
   TestEndPayload,
 } from "../types.js";
-import type { IRunStore, RunFilterStore } from "../db/store/index.js";
+import type { IRunStore, ProjectStore, RunFilterStore } from "../db/store/index.js";
+import { SlackNotifier } from "../integrations/slack-notifier.js";
 
 const MAX_ARTIFACT_BYTES = 200 * 1024 * 1024; // 200 MB (videos)
 
@@ -42,11 +44,35 @@ async function runBelongsToAuthProject(
   return run?.projectId === authProjectId(req);
 }
 
+function isFailedMainBranchCompletion(previousRun: RunRecord | null, run: RunRecord): boolean {
+  return (
+    !previousRun?.endedAt &&
+    Boolean(run.endedAt) &&
+    run.status === "failed" &&
+    run.git.branch === "main"
+  );
+}
+
+async function notifySlackRunFailure(
+  projectStore: ProjectStore,
+  slackNotifier: SlackNotifier,
+  run: RunRecord,
+): Promise<void> {
+  const project = await projectStore.getProject(run.projectId);
+  if (!project?.integrations.slack?.enabled) {
+    return;
+  }
+
+  await slackNotifier.notifyRunFailed(run, project);
+}
+
 export function createRunsRouter(
   store: IRunStore,
   artifactStorage: ArtifactStorage,
   uploadsDir: string,
+  projectStore: ProjectStore,
   runFilterStore?: RunFilterStore,
+  slackNotifier = SlackNotifier.fromEnv(),
 ): Router {
   const router = Router();
   const tempDir = join(uploadsDir, ".tmp");
@@ -257,13 +283,20 @@ export function createRunsRouter(
         return;
       }
 
-      if (!(await runBelongsToAuthProject(store, req, payload.ciBuildId))) {
+      const previousRun = await store.getRun(payload.ciBuildId);
+      if (!previousRun || previousRun.projectId !== authProjectId(req)) {
         res.status(404).json({ error: "Run not found" });
         return;
       }
 
       try {
         const run = await store.finishShard(payload);
+        if (isFailedMainBranchCompletion(previousRun, run)) {
+          void notifySlackRunFailure(projectStore, slackNotifier, run).catch((error) => {
+            console.error("[slack-notifier] Failed to send run failure notification", error);
+          });
+        }
+
         res.status(200).json({
           ok: true,
           ciBuildId: run.ciBuildId,

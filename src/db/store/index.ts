@@ -6,3 +6,4 @@ export { RunQueryStore } from "./run-query-store.js";
 export { RunFilterStore, type RunFilterAuthor, type RunFilterOptions } from "./run-filter-store.js";
 export { AnalyticsStore } from "./analytics-store.js";
 export { UserStore } from "./user-store.js";
+export { TicketStore } from "./ticket-store.js";

@@ -129,4 +129,49 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+CREATE TABLE IF NOT EXISTS tickets (
+  ticket_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL DEFAULT 'slack',
+  channel_id TEXT NOT NULL,
+  parent_ts TEXT NOT NULL,
+  title TEXT,
+  raw_body TEXT,
+  created_by TEXT,
+  account TEXT,
+  workspace TEXT,
+  owner TEXT,
+  severity TEXT,
+  stage TEXT,
+  subtype TEXT,
+  devrev_priority TEXT,
+  ai_priority TEXT,
+  ai_summary TEXT,
+  ai_category TEXT,
+  ai_suggestion TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  oncall_owner TEXT,
+  resolved_at TEXT,
+  ticket_created_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tickets_thread ON tickets(channel_id, parent_ts);
+CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
+CREATE INDEX IF NOT EXISTS idx_tickets_updated_at ON tickets(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS ticket_messages (
+  id TEXT PRIMARY KEY,
+  ticket_id TEXT NOT NULL,
+  slack_ts TEXT NOT NULL UNIQUE,
+  author TEXT,
+  author_id TEXT,
+  text TEXT,
+  is_parent INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (ticket_id) REFERENCES tickets(ticket_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket ON ticket_messages(ticket_id, created_at);
 `;

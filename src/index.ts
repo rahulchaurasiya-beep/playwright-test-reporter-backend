@@ -11,12 +11,15 @@ import {
   ProjectStore,
   RunFilterStore,
   RunQueryStore,
+  TicketStore,
   UserStore,
   createRunStore,
 } from "./db/store/index.js";
 import { createAuthRouter } from "./routes/auth.js";
 import { createProjectsUiRouter } from "./routes/projects-ui.js";
 import { createRunsRouter } from "./routes/runs.js";
+import { createSlackEventsRouter, slackEventsConfigFromEnv } from "./routes/slack-events.js";
+import { createTicketsUiRouter } from "./routes/tickets-ui.js";
 import { createArtifactStorageFromEnv } from "./storage/artifact-storage.js";
 
 const rootDir = join(fileURLToPath(new URL(".", import.meta.url)), "..");
@@ -36,10 +39,16 @@ const userStore = new UserStore(db);
 const runQueryStore = new RunQueryStore(db);
 const runFilterStore = new RunFilterStore(db);
 const analyticsStore = new AnalyticsStore(db);
+const ticketStore = new TicketStore(db);
 const artifactStorage = createArtifactStorageFromEnv(uploadsDir);
 const app = express();
 
 app.use(cors());
+
+// Slack events need the raw request body for signature verification, so this
+// router is mounted before the global JSON body parser.
+app.use("/api/slack", createSlackEventsRouter(ticketStore, slackEventsConfigFromEnv()));
+
 app.use(express.json({ limit: "10mb" }));
 app.use("/uploads", express.static(uploadsDir));
 
@@ -68,9 +77,15 @@ app.use(
 );
 
 app.use(
+  "/api/ui",
+  createJwtAuthMiddleware(),
+  createTicketsUiRouter(ticketStore),
+);
+
+app.use(
   "/api/v1",
   createReporterAuthMiddleware(projectStore),
-  createRunsRouter(store, artifactStorage, uploadsDir, runFilterStore),
+  createRunsRouter(store, artifactStorage, uploadsDir, projectStore, runFilterStore),
 );
 
 const server = app.listen(port, () => {
@@ -78,6 +93,8 @@ const server = app.listen(port, () => {
   console.log("  Metadata storage: postgres");
   console.log(`  Artifact storage: ${artifactStorage.mode}`);
   console.log(`  UI API:  http://localhost:${port}/api/ui/projects`);
+  console.log(`  Tickets: http://localhost:${port}/api/ui/tickets`);
+  console.log(`  Slack:   http://localhost:${port}/api/slack/events`);
   console.log(`  Reporter: http://localhost:${port}/api/v1/runs/*`);
   if (artifactStorage.mode === "local") {
     console.log(`  Uploads: ${uploadsDir}`);
