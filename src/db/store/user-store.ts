@@ -110,6 +110,7 @@ export class UserStore {
     email?: string;
     password: string;
   }): Promise<UserRecord | null> {
+    console.log("authenticate payload", payload);
     const username = payload.username?.trim()
       ? normalizeUsername(payload.username)
       : null;
