@@ -351,6 +351,13 @@ pnpm summary local-123    # print Run → Shards → Specs → Tests
 | `JWT_SECRET` | — | Required for UI auth (`/api/ui/*`) |
 | `JWT_EXPIRES_IN` | `7d` | JWT lifetime |
 | `DATA_DIR` | `./data` | Legacy data directory |
+| `UPLOADS_DIR` | `./uploads` | Artifact files root |
+| `SLACK_BOT_TOKEN` | unset | Slack bot token for failed run alerts (`chat:write` scope) |
+| `SLACK_ALERT_CHANNEL_ID` | unset | Slack channel ID for failure alerts |
+| `REPORTER_PUBLIC_BASE_URL` | unset | Public dashboard URL used in Slack run links |
+| `SLACK_MAX_THREAD_REPLIES` | `20` | Maximum failed tests to post in the Slack thread |
+| `SLACK_ALERT_BRANCHES` | `main` | Comma-separated git branches that trigger failure alerts |
+| `SLACK_ALERT_MENTION_USER_IDS` | unset | Comma-separated Slack user IDs to @mention in the failure thread |
 | `UPLOADS_DIR` | `./uploads` | Local artifact root (when not using S3) |
 
 Reporter clients use per-project `REPORTER_PROJECT_ID` + `REPORTER_API_KEY` (created in the UI — not a backend env var).
