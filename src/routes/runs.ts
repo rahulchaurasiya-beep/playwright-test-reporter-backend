@@ -44,12 +44,23 @@ async function runBelongsToAuthProject(
   return run?.projectId === authProjectId(req);
 }
 
-function isFailedMainBranchCompletion(previousRun: RunRecord | null, run: RunRecord): boolean {
+function getSlackAlertBranches(): string[] {
+  const raw = process.env.SLACK_ALERT_BRANCHES?.trim();
+  if (!raw) return ["main"];
+  return raw
+    .split(",")
+    .map((branch) => branch.trim())
+    .filter(Boolean);
+}
+
+function isFailedAlertBranchCompletion(previousRun: RunRecord | null, run: RunRecord): boolean {
+  const branch = run.git.branch;
   return (
     !previousRun?.endedAt &&
     Boolean(run.endedAt) &&
     run.status === "failed" &&
-    run.git.branch === "main"
+    branch !== null &&
+    getSlackAlertBranches().includes(branch)
   );
 }
 
@@ -291,7 +302,7 @@ export function createRunsRouter(
 
       try {
         const run = await store.finishShard(payload);
-        if (isFailedMainBranchCompletion(previousRun, run)) {
+        if (isFailedAlertBranchCompletion(previousRun, run)) {
           void notifySlackRunFailure(projectStore, slackNotifier, run).catch((error) => {
             console.error("[slack-notifier] Failed to send run failure notification", error);
           });

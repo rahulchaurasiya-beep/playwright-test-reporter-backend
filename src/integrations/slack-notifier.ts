@@ -5,6 +5,7 @@ import { resolveWorkflowRunUrl } from "../utils/workflow-url.js";
 const SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage";
 const DEFAULT_MAX_THREAD_REPLIES = 20;
 const FAILED_STATUSES: TestStatus[] = ["failed", "timedOut", "interrupted"];
+const FAILURE_COLOR = "#E01E5A";
 
 type SlackPostMessageResponse = {
   ok: boolean;
@@ -12,18 +13,27 @@ type SlackPostMessageResponse = {
   error?: string;
 };
 
+type SlackBlock = Record<string, unknown>;
+
 type SlackNotifierConfig = {
   botToken: string | null;
   channelId: string | null;
   publicBaseUrl: string | null;
   maxThreadReplies: number;
+  mentionUserIds: string[];
 };
 
 type TestSummary = {
   passed: number;
   failed: number;
   skipped: number;
+  timedOut: number;
+  interrupted: number;
   total: number;
+};
+
+type ProjectGroupSummary = TestSummary & {
+  projectName: string;
 };
 
 type FailedTest = TestRecord & {
@@ -47,6 +57,26 @@ function truncate(value: string, maxLength: number): string {
   return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+function stripAnsiCodes(value: string): string {
+  return value
+    .replace(/\u001B\[[0-9;]*m/g, "")
+    .replace(/\[[0-9;]*m/g, "");
+}
+
+function collapseWhitespace(value: string): string {
+  return stripAnsiCodes(value).replace(/\s+/g, " ").trim();
+}
+
+function normalizeMultilineText(value: string): string {
+  return stripAnsiCodes(value)
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+/g, " ").trimEnd())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function formatDuration(durationMs: number | null | undefined): string {
   if (!durationMs || durationMs < 0) return "0s";
   const seconds = Math.round(durationMs / 1000);
@@ -65,10 +95,29 @@ function slackLink(url: string | null, label: string): string | null {
   return `<${url.replace(/[|>]/g, "")}|${slackEscape(label)}>`;
 }
 
+function formatTestTitle(title: string[]): string {
+  if (!title.length) return "Unknown test";
+  return title.join(" › ");
+}
+
 function buildReporterRunUrl(publicBaseUrl: string | null, run: RunRecord): string | null {
   if (!publicBaseUrl) return null;
   const baseUrl = publicBaseUrl.replace(/\/+$/, "");
   return `${baseUrl}/projects/${encodeURIComponent(run.projectId)}/runs/${encodeURIComponent(run.ciBuildId)}/summary`;
+}
+
+function buildReporterTestUrl(
+  publicBaseUrl: string | null,
+  run: RunRecord,
+  test: FailedTest,
+): string | null {
+  if (!publicBaseUrl) return null;
+  const baseUrl = publicBaseUrl.replace(/\/+$/, "");
+  const params = new URLSearchParams({
+    path: test.specPath,
+    retry: String(test.retryIndex),
+  });
+  return `${baseUrl}/projects/${encodeURIComponent(run.projectId)}/runs/${encodeURIComponent(run.ciBuildId)}/tests/${encodeURIComponent(test.testId)}?${params}`;
 }
 
 function latestTests(run: RunRecord): TestRecord[] {
@@ -88,22 +137,55 @@ function latestTests(run: RunRecord): TestRecord[] {
   return Array.from(byTestId.values());
 }
 
-function summarizeLatestTests(run: RunRecord): TestSummary {
-  const summary: TestSummary = {
+function emptySummary(): TestSummary {
+  return {
     passed: 0,
     failed: 0,
     skipped: 0,
+    timedOut: 0,
+    interrupted: 0,
     total: 0,
   };
+}
+
+function summarizeLatestTests(run: RunRecord): TestSummary {
+  const summary = emptySummary();
 
   for (const test of latestTests(run)) {
     summary.total += 1;
     if (test.status === "passed") summary.passed += 1;
     else if (test.status === "skipped") summary.skipped += 1;
+    else if (test.status === "timedOut") summary.timedOut += 1;
+    else if (test.status === "interrupted") summary.interrupted += 1;
     else summary.failed += 1;
   }
 
+  summary.failed += summary.timedOut + summary.interrupted;
   return summary;
+}
+
+function summarizeByProject(run: RunRecord): ProjectGroupSummary[] {
+  const groups = new Map<string, TestSummary>();
+
+  for (const test of latestTests(run)) {
+    const projectName = test.projectName?.trim() || "default";
+    const summary = groups.get(projectName) ?? emptySummary();
+    summary.total += 1;
+    if (test.status === "passed") summary.passed += 1;
+    else if (test.status === "skipped") summary.skipped += 1;
+    else if (test.status === "timedOut") summary.timedOut += 1;
+    else if (test.status === "interrupted") summary.interrupted += 1;
+    else summary.failed += 1;
+    groups.set(projectName, summary);
+  }
+
+  return Array.from(groups.entries())
+    .map(([projectName, summary]) => ({
+      projectName,
+      ...summary,
+      failed: summary.failed + summary.timedOut + summary.interrupted,
+    }))
+    .sort((a, b) => a.projectName.localeCompare(b.projectName));
 }
 
 function collectFailedTests(run: RunRecord): FailedTest[] {
@@ -126,46 +208,318 @@ function collectFailedTests(run: RunRecord): FailedTest[] {
     .sort((a, b) => a.specPath.localeCompare(b.specPath) || a.order - b.order);
 }
 
-function buildParentMessage(
+function runTitle(run: RunRecord): string {
+  return run.ci.prTitle || run.git.commitMessage || `Run ${run.ciBuildId}`;
+}
+
+function parseMentionUserIds(raw: string | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return raw
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => /^U[A-Z0-9]+$/i.test(id));
+}
+
+function formatSlackMentions(userIds: string[]): string {
+  return userIds.map((id) => `<@${id}>`).join(" ");
+}
+
+function buildMentionThreadPayload(
+  mentionUserIds: string[],
+): { text: string; blocks: SlackBlock[] } | null {
+  if (!mentionUserIds.length) return null;
+
+  const mentions = formatSlackMentions(mentionUserIds);
+  const text = `${mentions} please check the failures.`;
+
+  return {
+    text,
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `${mentions}\n_Please check the failures._`,
+        },
+      },
+    ],
+  };
+}
+
+function progressBar(passed: number, total: number, width = 10): string {
+  if (total <= 0) return "░".repeat(width);
+  const filled = Math.max(0, Math.min(width, Math.round((passed / total) * width)));
+  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+}
+
+function buildReporterProjectUrl(publicBaseUrl: string | null, projectId: string): string | null {
+  if (!publicBaseUrl) return null;
+  const baseUrl = publicBaseUrl.replace(/\/+$/, "");
+  return `${baseUrl}/projects/${encodeURIComponent(projectId)}/runs`;
+}
+
+function buildBranchUrl(run: RunRecord): string | null {
+  const branch = run.git.branch?.trim();
+  if (!branch || !run.ci.repository) return null;
+  return `https://github.com/${run.ci.repository}/tree/${encodeURIComponent(branch)}`;
+}
+
+function buildParentPayload(
   run: RunRecord,
   project: ProjectRecord,
   publicBaseUrl: string | null,
-): string {
+): { text: string; blocks: SlackBlock[]; attachments: Record<string, unknown>[] } {
+  const title = runTitle(run);
+  const titledWithPr =
+    run.ci.prNumber && !title.includes(`#${run.ci.prNumber}`)
+      ? `${title} (#${run.ci.prNumber})`
+      : title;
   const summary = summarizeLatestTests(run);
   const workflowUrl = resolveWorkflowRunUrl(run.ci, run.ciBuildId);
   const reporterUrl = buildReporterRunUrl(publicBaseUrl, run);
-  const links = [
-    slackLink(workflowUrl, "View in GitHub Actions"),
-    slackLink(reporterUrl, "View in Reporter"),
-  ].filter((link): link is string => Boolean(link));
-  const title = run.ci.prTitle || run.git.commitMessage || `Run ${run.ciBuildId}`;
+  const projectUrl = buildReporterProjectUrl(publicBaseUrl, run.projectId);
+  const branchUrl = buildBranchUrl(run);
+  const branch = run.git.branch ?? "unknown";
   const shaLabel = shortSha(run.git.sha);
-  const shaLink = run.ci.repository && run.git.sha
-    ? slackLink(`https://github.com/${run.ci.repository}/commit/${run.git.sha}`, shaLabel)
-    : null;
+  const shaUrl =
+    run.ci.repository && run.git.sha
+      ? `https://github.com/${run.ci.repository}/commit/${run.git.sha}`
+      : null;
 
-  return [
-    `:x: *${slackEscape(truncate(title, 180))}*`,
-    `Project: *${slackEscape(project.name)}* | Build ID: \`${slackEscape(run.ciBuildId)}\``,
-    `Commit: ${shaLink ?? `\`${slackEscape(shaLabel)}\``} | Branch: \`${slackEscape(run.git.branch ?? "unknown")}\` | Author: ${slackEscape(run.git.authorName ?? "unknown")}`,
-    `Failed: *${summary.failed}* | Passed: ${summary.passed} | Skipped: ${summary.skipped} | Total: ${summary.total} | Duration: ${formatDuration(run.durationMs)}`,
-    links.length ? links.join(" | ") : null,
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
+  const projectLabel = projectUrl
+    ? slackLink(projectUrl, project.name)
+    : slackEscape(project.name);
+  const buildIdLabel = workflowUrl
+    ? slackLink(workflowUrl, run.ciBuildId)
+    : `\`${slackEscape(run.ciBuildId)}\``;
+  const commitLabel = shaUrl ? slackLink(shaUrl, shaLabel) : `\`${slackEscape(shaLabel)}\``;
+  const branchLabel = branchUrl
+    ? slackLink(branchUrl, branch)
+    : `\`${slackEscape(branch)}\``;
+
+  const headerBlock: SlackBlock = {
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `*${slackEscape(truncate(titledWithPr, 220))}*`,
+    },
+  };
+
+  if (reporterUrl) {
+    headerBlock.accessory = {
+      type: "button",
+      text: { type: "plain_text", text: "View in RAT", emoji: true },
+      url: reporterUrl,
+    };
+  }
+
+  const blocks: SlackBlock[] = [
+    headerBlock,
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `*Project:* ${projectLabel} | *Build ID:* ${buildIdLabel}`,
+        },
+      ],
+    },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `*Commit:* ${commitLabel} | *Branch:* ${branchLabel} | *Author:* ${slackEscape(run.git.authorName ?? "unknown")}`,
+        },
+      ],
+    },
+  ];
+
+  const attachmentBlocks: SlackBlock[] = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: [
+          `*Failed:* ${summary.failed}`,
+          `*Passed:* ${summary.passed}`,
+          `*Skipped:* ${summary.skipped}`,
+          `*Total:* ${summary.total}`,
+          `*Duration:* ${formatDuration(run.durationMs)}`,
+        ].join("   "),
+      },
+    },
+  ];
+
+  const commitBody = collapseWhitespace(run.git.commitMessage ?? "");
+  if (commitBody) {
+    attachmentBlocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: slackEscape(truncate(commitBody, 400)),
+      },
+    });
+  }
+
+  const actionButtons: Record<string, unknown>[] = [];
+  if (reporterUrl) {
+    actionButtons.push({
+      type: "button",
+      text: { type: "plain_text", text: "View in RAT", emoji: true },
+      url: reporterUrl,
+    });
+  }
+  if (workflowUrl) {
+    actionButtons.push({
+      type: "button",
+      text: { type: "plain_text", text: "Open GitHub Actions Run", emoji: true },
+      url: workflowUrl,
+    });
+  }
+  if (actionButtons.length) {
+    attachmentBlocks.push({
+      type: "actions",
+      elements: actionButtons,
+    });
+  }
+
+  return {
+    text: `❌ ${titledWithPr}`,
+    blocks,
+    attachments: [{ color: FAILURE_COLOR, blocks: attachmentBlocks }],
+  };
 }
 
-function formatFailedTestReply(test: FailedTest): string {
-  const title = test.title.length ? test.title.join(" › ") : test.testId;
-  const errorMessage = test.error?.message ? truncate(test.error.message, 1200) : "No error message captured";
-  const snippet = test.error?.snippet ? `\n\`\`\`${truncate(test.error.snippet, 1500)}\`\`\`` : "";
+function buildSummaryThreadPayload(run: RunRecord): { text: string; blocks: SlackBlock[] } {
+  const groups = summarizeByProject(run);
+  const branch = run.git.branch ?? "unknown";
+  const header = `*Run Failed* | \`${slackEscape(branch)}\``;
 
+  if (!groups.length) {
+    return {
+      text: `Run Failed | ${branch}`,
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: header } }],
+    };
+  }
+
+  const lines = [
+    header,
+    "",
+    "```",
+    padSlackTableRow("Group", "Progress", "Total", "Passed", "Failed", "Skipped"),
+    ...groups.map((group) =>
+      padSlackTableRow(
+        group.projectName,
+        progressBar(group.passed, group.total),
+        String(group.total),
+        String(group.passed),
+        String(group.failed),
+        String(group.skipped),
+      ),
+    ),
+    "```",
+  ];
+
+  return {
+    text: `Run Failed | ${branch}`,
+    blocks: [{ type: "section", text: { type: "mrkdwn", text: lines.join("\n") } }],
+  };
+}
+
+function padSlackTableRow(
+  group: string,
+  progress: string,
+  total: string,
+  passed: string,
+  failed: string,
+  skipped: string,
+): string {
   return [
-    `*${slackEscape(title)}*`,
-    `Spec: \`${slackEscape(test.specPath)}\``,
-    `Project: ${slackEscape(test.projectName)} | Status: \`${slackEscape(test.status)}\` | Attempt: ${test.retryIndex + 1} | Duration: ${formatDuration(test.durationMs)}`,
-    `Error: ${slackEscape(errorMessage)}${snippet}`,
-  ].join("\n");
+    group.padEnd(14),
+    progress.padEnd(12),
+    total.padStart(5),
+    passed.padStart(7),
+    failed.padStart(7),
+    skipped.padStart(8),
+  ].join(" ");
+}
+
+function extractErrorMessage(test: FailedTest): string {
+  const raw = test.error?.message
+    ? normalizeMultilineText(test.error.message)
+    : "No error message captured";
+  const withoutCallLog = raw.split(/^Call log:\s*/m)[0]?.trim() ?? raw;
+  return truncate(withoutCallLog, 1200);
+}
+
+function extractErrorSnippet(test: FailedTest): string | null {
+  if (!test.error?.snippet) return null;
+  const cleaned = normalizeMultilineText(test.error.snippet);
+  return cleaned ? truncate(cleaned, 2000) : null;
+}
+
+function buildFailedTestPayload(
+  run: RunRecord,
+  test: FailedTest,
+  publicBaseUrl: string | null,
+): { text: string; blocks: SlackBlock[]; attachments: Record<string, unknown>[] } {
+  const title = formatTestTitle(test.title);
+  const detailsUrl = buildReporterTestUrl(publicBaseUrl, run, test);
+  const metaParts = [
+    `*Group:* ${slackEscape(test.projectName)}`,
+    `*Attempt ${test.retryIndex + 1} failed* | ${formatDuration(test.durationMs)}`,
+  ];
+
+  const titleBlock: SlackBlock = {
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `:x: *${slackEscape(title)}*`,
+    },
+  };
+  if (detailsUrl) {
+    titleBlock.accessory = {
+      type: "button",
+      text: { type: "plain_text", text: "View in RAT", emoji: true },
+      url: detailsUrl,
+    };
+  }
+
+  const blocks: SlackBlock[] = [
+    titleBlock,
+    {
+      type: "section",
+      fields: [
+        { type: "mrkdwn", text: `*Spec:*\n\`${slackEscape(test.specPath)}\`` },
+        { type: "mrkdwn", text: metaParts.join(" | ") },
+      ],
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `\`\`\`${slackEscape(extractErrorMessage(test))}\`\`\``,
+      },
+    },
+  ];
+
+  const snippet = extractErrorSnippet(test);
+  if (snippet) {
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `\`\`\`${slackEscape(snippet)}\`\`\``,
+      },
+    });
+  }
+
+  return {
+    text: `❌ ${title}`,
+    blocks,
+    attachments: [{ color: FAILURE_COLOR, blocks: [] }],
+  };
 }
 
 export class SlackNotifier {
@@ -176,7 +530,9 @@ export class SlackNotifier {
       botToken: trimEnv(env.SLACK_BOT_TOKEN),
       channelId: trimEnv(env.SLACK_ALERT_CHANNEL_ID),
       publicBaseUrl: trimEnv(env.REPORTER_PUBLIC_BASE_URL),
-      maxThreadReplies: Number.parseInt(env.SLACK_MAX_THREAD_REPLIES ?? "", 10) || DEFAULT_MAX_THREAD_REPLIES,
+      maxThreadReplies:
+        Number.parseInt(env.SLACK_MAX_THREAD_REPLIES ?? "", 10) || DEFAULT_MAX_THREAD_REPLIES,
+      mentionUserIds: parseMentionUserIds(env.SLACK_ALERT_MENTION_USER_IDS),
     });
   }
 
@@ -186,29 +542,76 @@ export class SlackNotifier {
 
   async notifyRunFailed(run: RunRecord, project: ProjectRecord): Promise<void> {
     if (!this.isConfigured) {
-      console.warn("[slack-notifier] Missing SLACK_BOT_TOKEN or SLACK_ALERT_CHANNEL_ID; skipping notification");
+      console.warn(
+        "[slack-notifier] Missing SLACK_BOT_TOKEN or SLACK_ALERT_CHANNEL_ID; skipping notification",
+      );
       return;
     }
 
     const failedTests = collectFailedTests(run);
-    const parent = await this.postMessage(buildParentMessage(run, project, this.config.publicBaseUrl));
-    const threadTs = parent.ts;
+    const parent = buildParentPayload(run, project, this.config.publicBaseUrl);
+    const parentResponse = await this.postMessage(parent);
+    const threadTs = parentResponse.ts;
     if (!threadTs) {
       throw new Error("Slack did not return a message timestamp for the parent alert");
     }
 
+    await this.postMessage(buildSummaryThreadPayload(run), threadTs);
+
     const replies = failedTests.slice(0, this.config.maxThreadReplies);
     for (const test of replies) {
-      await this.postMessage(formatFailedTestReply(test), threadTs);
+      await this.postMessage(
+        buildFailedTestPayload(run, test, this.config.publicBaseUrl),
+        threadTs,
+      );
     }
 
     const omitted = failedTests.length - replies.length;
     if (omitted > 0) {
-      await this.postMessage(`_${omitted} more failed test${omitted === 1 ? "" : "s"} not shown._`, threadTs);
+      const runUrl = buildReporterRunUrl(this.config.publicBaseUrl, run);
+      const omittedText = `_${omitted} more failed test${omitted === 1 ? "" : "s"} not shown in Slack._`;
+      const omittedBlocks: SlackBlock[] = [
+        {
+          type: "context",
+          elements: [{ type: "mrkdwn", text: omittedText }],
+        },
+      ];
+      if (runUrl) {
+        omittedBlocks.push({
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "View all failures in RAT", emoji: true },
+              url: runUrl,
+            },
+          ],
+        });
+      }
+
+      await this.postMessage(
+        {
+          text: `${omitted} more failed test${omitted === 1 ? "" : "s"} not shown.`,
+          blocks: omittedBlocks,
+        },
+        threadTs,
+      );
+    }
+
+    const mentionPayload = buildMentionThreadPayload(this.config.mentionUserIds);
+    if (mentionPayload) {
+      await this.postMessage(mentionPayload, threadTs);
     }
   }
 
-  private async postMessage(text: string, threadTs?: string): Promise<SlackPostMessageResponse> {
+  private async postMessage(
+    payload: {
+      text: string;
+      blocks?: SlackBlock[];
+      attachments?: Record<string, unknown>[];
+    },
+    threadTs?: string,
+  ): Promise<SlackPostMessageResponse> {
     const response = await fetch(SLACK_POST_MESSAGE_URL, {
       method: "POST",
       headers: {
@@ -217,8 +620,12 @@ export class SlackNotifier {
       },
       body: JSON.stringify({
         channel: this.config.channelId,
-        text,
+        text: payload.text,
+        blocks: payload.blocks,
+        attachments: payload.attachments,
         mrkdwn: true,
+        unfurl_links: false,
+        unfurl_media: false,
         thread_ts: threadTs,
       }),
     });
@@ -227,7 +634,7 @@ export class SlackNotifier {
       throw new Error(`Slack API request failed with HTTP ${response.status}`);
     }
 
-    const body = await response.json() as SlackPostMessageResponse;
+    const body = (await response.json()) as SlackPostMessageResponse;
     if (!body.ok) {
       throw new Error(`Slack API request failed: ${body.error ?? "unknown error"}`);
     }
