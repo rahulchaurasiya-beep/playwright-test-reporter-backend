@@ -542,27 +542,46 @@ export class SlackNotifier {
 
   async notifyRunFailed(run: RunRecord, project: ProjectRecord): Promise<void> {
     if (!this.isConfigured) {
-      console.warn(
-        "[slack-notifier] Missing SLACK_BOT_TOKEN or SLACK_ALERT_CHANNEL_ID; skipping notification",
-      );
+      console.warn("[slack-notifier] Missing SLACK_BOT_TOKEN or SLACK_ALERT_CHANNEL_ID; skipping notification", {
+        ciBuildId: run.ciBuildId,
+        hasBotToken: Boolean(this.config.botToken),
+        hasChannelId: Boolean(this.config.channelId),
+      });
       return;
     }
 
+    console.log("[slack-notifier] Building failure notification payload", {
+      ciBuildId: run.ciBuildId,
+      projectId: project.projectId,
+      channelId: this.config.channelId,
+    });
+
     const failedTests = collectFailedTests(run);
     const parent = buildParentPayload(run, project, this.config.publicBaseUrl);
-    const parentResponse = await this.postMessage(parent);
+    const parentResponse = await this.postMessage(parent, undefined, "parent-alert");
     const threadTs = parentResponse.ts;
     if (!threadTs) {
+      console.error("[slack-notifier] Slack parent message missing thread timestamp", {
+        ciBuildId: run.ciBuildId,
+        response: parentResponse,
+      });
       throw new Error("Slack did not return a message timestamp for the parent alert");
     }
 
-    await this.postMessage(buildSummaryThreadPayload(run), threadTs);
+    console.log("[slack-notifier] Posted parent alert", {
+      ciBuildId: run.ciBuildId,
+      threadTs,
+      failedTestCount: failedTests.length,
+    });
+
+    await this.postMessage(buildSummaryThreadPayload(run), threadTs, "summary-thread");
 
     const replies = failedTests.slice(0, this.config.maxThreadReplies);
-    for (const test of replies) {
+    for (const [index, test] of replies.entries()) {
       await this.postMessage(
         buildFailedTestPayload(run, test, this.config.publicBaseUrl),
         threadTs,
+        `failed-test-${index + 1}`,
       );
     }
 
@@ -595,13 +614,21 @@ export class SlackNotifier {
           blocks: omittedBlocks,
         },
         threadTs,
+        "omitted-failures",
       );
     }
 
     const mentionPayload = buildMentionThreadPayload(this.config.mentionUserIds);
     if (mentionPayload) {
-      await this.postMessage(mentionPayload, threadTs);
+      await this.postMessage(mentionPayload, threadTs, "mentions");
     }
+
+    console.log("[slack-notifier] Finished posting failure notification thread", {
+      ciBuildId: run.ciBuildId,
+      threadTs,
+      postedFailedTests: replies.length,
+      omittedFailedTests: Math.max(failedTests.length - replies.length, 0),
+    });
   }
 
   private async postMessage(
@@ -611,6 +638,7 @@ export class SlackNotifier {
       attachments?: Record<string, unknown>[];
     },
     threadTs?: string,
+    step = "message",
   ): Promise<SlackPostMessageResponse> {
     const response = await fetch(SLACK_POST_MESSAGE_URL, {
       method: "POST",
@@ -631,13 +659,32 @@ export class SlackNotifier {
     });
 
     if (!response.ok) {
+      const responseText = await response.text();
+      console.error("[slack-notifier] Slack HTTP request failed", {
+        step,
+        threadTs,
+        status: response.status,
+        responseText,
+      });
       throw new Error(`Slack API request failed with HTTP ${response.status}`);
     }
 
     const body = (await response.json()) as SlackPostMessageResponse;
     if (!body.ok) {
+      console.error("[slack-notifier] Slack API returned error", {
+        step,
+        threadTs,
+        error: body.error,
+        response: body,
+      });
       throw new Error(`Slack API request failed: ${body.error ?? "unknown error"}`);
     }
+
+    console.log("[slack-notifier] Slack message posted", {
+      step,
+      threadTs: threadTs ?? body.ts,
+      messageTs: body.ts,
+    });
 
     return body;
   }

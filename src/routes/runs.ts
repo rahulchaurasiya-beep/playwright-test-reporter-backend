@@ -53,15 +53,34 @@ function getSlackAlertBranches(): string[] {
     .filter(Boolean);
 }
 
-function isFailedAlertBranchCompletion(previousRun: RunRecord | null, run: RunRecord): boolean {
+function shouldNotifySlackRunFailure(previousRun: RunRecord | null, run: RunRecord): boolean {
   const branch = run.git.branch;
-  return (
-    !previousRun?.endedAt &&
-    Boolean(run.endedAt) &&
-    run.status === "failed" &&
-    branch !== null &&
-    getSlackAlertBranches().includes(branch)
-  );
+  const alertBranches = getSlackAlertBranches();
+  const ctx = { ciBuildId: run.ciBuildId, branch, status: run.status, alertBranches };
+
+  if (previousRun?.endedAt) {
+    console.log("[slack-notifier] Skipping notification: run already ended", ctx);
+    return false;
+  }
+  if (!run.endedAt) {
+    console.log("[slack-notifier] Skipping notification: run not complete", ctx);
+    return false;
+  }
+  if (run.status !== "failed") {
+    console.log("[slack-notifier] Skipping notification: run did not fail", ctx);
+    return false;
+  }
+  if (branch === null) {
+    console.log("[slack-notifier] Skipping notification: branch is null", ctx);
+    return false;
+  }
+  if (!alertBranches.includes(branch)) {
+    console.log("[slack-notifier] Skipping notification: branch not in SLACK_ALERT_BRANCHES", ctx);
+    return false;
+  }
+
+  console.log("[slack-notifier] Run eligible for failure notification", ctx);
+  return true;
 }
 
 async function notifySlackRunFailure(
@@ -69,12 +88,41 @@ async function notifySlackRunFailure(
   slackNotifier: SlackNotifier,
   run: RunRecord,
 ): Promise<void> {
+  console.log("[slack-notifier] Evaluating project Slack integration", {
+    ciBuildId: run.ciBuildId,
+    projectId: run.projectId,
+  });
+
   const project = await projectStore.getProject(run.projectId);
-  if (!project?.integrations.slack?.enabled) {
+  if (!project) {
+    console.warn("[slack-notifier] Skipping notification: project not found", {
+      ciBuildId: run.ciBuildId,
+      projectId: run.projectId,
+    });
+    return;
+  }
+  if (!project.integrations.slack?.enabled) {
+    console.log("[slack-notifier] Skipping notification: Slack integration disabled for project", {
+      ciBuildId: run.ciBuildId,
+      projectId: run.projectId,
+      projectName: project.name,
+    });
     return;
   }
 
+  console.log("[slack-notifier] Sending run failure notification", {
+    ciBuildId: run.ciBuildId,
+    projectId: run.projectId,
+    projectName: project.name,
+    slackConfigured: slackNotifier.isConfigured,
+  });
+
   await slackNotifier.notifyRunFailed(run, project);
+
+  console.log("[slack-notifier] Run failure notification completed", {
+    ciBuildId: run.ciBuildId,
+    projectId: run.projectId,
+  });
 }
 
 export function createRunsRouter(
@@ -302,9 +350,15 @@ export function createRunsRouter(
 
       try {
         const run = await store.finishShard(payload);
-        if (isFailedAlertBranchCompletion(previousRun, run)) {
+        if (shouldNotifySlackRunFailure(previousRun, run)) {
           void notifySlackRunFailure(projectStore, slackNotifier, run).catch((error) => {
-            console.error("[slack-notifier] Failed to send run failure notification", error);
+            console.error("[slack-notifier] Failed to send run failure notification", {
+              ciBuildId: run.ciBuildId,
+              projectId: run.projectId,
+              branch: run.git.branch,
+              error: error instanceof Error ? error.message : String(error),
+              stack: error instanceof Error ? error.stack : undefined,
+            });
           });
         }
 
