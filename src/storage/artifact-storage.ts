@@ -23,6 +23,7 @@ export interface ArtifactStorage {
     sizeBytes: number;
   }): Promise<{ storageRef: string; sizeBytes: number }>;
   serveArtifact(res: Response, ref: ArtifactFileRef): Promise<boolean>;
+  readArtifact(ref: ArtifactFileRef): Promise<Buffer | null>;
 }
 
 export type ArtifactStorageConfig = {

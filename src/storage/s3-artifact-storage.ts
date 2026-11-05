@@ -117,5 +117,22 @@ export function createS3ArtifactStorage(config: ArtifactStorageConfig): Artifact
       await pipeline(result.Body as NodeJS.ReadableStream, res);
       return true;
     },
+
+    async readArtifact(ref) {
+      if (!isS3StorageRef(ref.filePath)) {
+        return null;
+      }
+
+      const result = await client.send(
+        new GetObjectCommand({
+          Bucket: s3Config.bucket,
+          Key: fromS3StorageRef(ref.filePath),
+        }),
+      );
+      if (!result.Body) {
+        return null;
+      }
+      return Buffer.from(await result.Body.transformToByteArray());
+    },
   };
 }

@@ -57,13 +57,14 @@ async function notifySlackRunFailure(
   projectStore: ProjectStore,
   slackNotifier: SlackNotifier,
   run: RunRecord,
+  artifactStorage: ArtifactStorage,
 ): Promise<void> {
   const project = await projectStore.getProject(run.projectId);
   if (!project?.integrations.slack?.enabled) {
     return;
   }
 
-  await slackNotifier.notifyRunFailed(run, project);
+  await slackNotifier.notifyRunFailed(run, project, artifactStorage);
 }
 
 export function createRunsRouter(
@@ -292,7 +293,7 @@ export function createRunsRouter(
       try {
         const run = await store.finishShard(payload);
         if (isFailedMainBranchCompletion(previousRun, run)) {
-          void notifySlackRunFailure(projectStore, slackNotifier, run).catch((error) => {
+          void notifySlackRunFailure(projectStore, slackNotifier, run, artifactStorage).catch((error) => {
             console.error("[slack-notifier] Failed to send run failure notification", error);
           });
         }

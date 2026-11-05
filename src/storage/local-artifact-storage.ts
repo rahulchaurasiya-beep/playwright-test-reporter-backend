@@ -1,5 +1,6 @@
 import type { Response } from "express";
 import { createReadStream, existsSync, mkdirSync, renameSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { ArtifactStorage, ArtifactStorageConfig } from "./artifact-storage.js";
@@ -46,6 +47,13 @@ export function createLocalArtifactStorage(
 
       await pipeline(createReadStream(ref.filePath), res);
       return true;
+    },
+
+    async readArtifact(ref) {
+      if (!existsSync(ref.filePath)) {
+        return null;
+      }
+      return readFile(ref.filePath);
     },
   };
 }
